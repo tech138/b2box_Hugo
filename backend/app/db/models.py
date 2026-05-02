@@ -72,5 +72,6 @@ class AuditLog(SQLModel, table=True):
     product_name: str | None = Field(default=None)
     product_code: str | None = Field(default=None)        # b2boxProductCode (BX)
     product_image_url: str | None = Field(default=None)
+    product_source_url: str | None = Field(default=None)  # link al proveedor
     related_product_name: str | None = Field(default=None)
     related_product_code: str | None = Field(default=None)

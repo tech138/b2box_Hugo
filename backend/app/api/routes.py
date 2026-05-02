@@ -92,6 +92,7 @@ def _humanize(entry: AuditLog) -> dict[str, Any]:
             "name": entry.product_name,
             "code": entry.product_code,
             "image_url": entry.product_image_url,
+            "source_url": entry.product_source_url,
         },
         "related_product": (
             {
@@ -260,6 +261,8 @@ async def verify(payload: VerifyRequest) -> VerifyResponse:
                     detail = f"Verify para '{payload.name[:60]}': no duplicado, Paco falló: {response.paco_error[:120]}"
                 else:
                     detail = f"Verify para '{payload.name[:60]}': no duplicado, sin image_url para Paco"
+            # Filtrar imagenes vacías que pueda mandar Luis (image_urls=[""] etc.)
+            valid_imgs = [u for u in (payload.image_urls or []) if u and u.strip()]
             session.add(AuditLog(
                 action=action,
                 source=payload.source or "luis",
@@ -267,7 +270,8 @@ async def verify(payload: VerifyRequest) -> VerifyResponse:
                 detail=detail[:500],
                 confidence=verdict.confidence,
                 product_name=payload.name[:200] if payload.name else None,
-                product_image_url=payload.image_urls[0] if payload.image_urls else None,
+                product_image_url=valid_imgs[0] if valid_imgs else None,
+                product_source_url=payload.source_url,
             ))
             session.commit()
     except Exception:  # noqa: BLE001
@@ -419,6 +423,63 @@ async def reset_setting(key: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"key": key, "value": new_value, "ok": True, "reset": True}
+
+
+@router.get("/api/debug-config")
+async def debug_config() -> dict[str, Any]:
+    """Diagnóstico: dice qué env vars están seteadas (sin exponer los valores).
+
+    Útil para verificar desde fuera del container que la config está completa
+    sin necesidad de entrar a Coolify ni mirar logs.
+    """
+    from app.config import get_settings
+    s = get_settings()
+
+    def _mask(v: str | None) -> dict[str, Any]:
+        if not v:
+            return {"set": False, "preview": None, "length": 0}
+        # mostramos solo los primeros 4 chars y los últimos 2 (suficiente para identificar)
+        if len(v) <= 8:
+            preview = v[:1] + "***"
+        else:
+            preview = f"{v[:4]}…{v[-2:]}"
+        return {"set": True, "preview": preview, "length": len(v)}
+
+    return {
+        "vendure": {
+            "api_url": s.vendure_api_url,
+            "bearer": _mask(s.vendure_bearer),
+            "channel_token": s.vendure_channel_token,
+            "user": _mask(s.vendure_user),
+            "pass": _mask(s.vendure_pass),
+            "source_url_field": s.vendure_source_url_field,
+        },
+        "rapidapi": {
+            "key": _mask(s.rapidapi_key),
+            "host": s.otapi_1688_host,
+        },
+        "hugo_auth": {
+            "api_key": _mask(s.hugo_api_key),
+        },
+        "paco": {
+            "url": s.paco_url,
+            "api_key": _mask(s.paco_api_key),
+            "submit_path": s.paco_submit_path,
+            "cf_client_id": _mask(s.paco_cf_client_id),
+            "cf_client_secret": _mask(s.paco_cf_client_secret),
+        },
+        "alerts": {
+            "smtp_host": s.alert_smtp_host,
+            "smtp_user": _mask(s.alert_smtp_user),
+            "smtp_pass": _mask(s.alert_smtp_pass),
+            "email_to": s.alert_email_to,
+            "webhook_url": s.alert_webhook_url or None,
+        },
+        "database": {
+            "url_starts_with": (s.database_url[:30] + "…") if s.database_url else None,
+            "is_postgres": s.database_url.startswith("postgresql"),
+        },
+    }
 
 
 @router.get("/api/sections")
