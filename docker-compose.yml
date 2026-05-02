@@ -23,8 +23,12 @@ services:
     env_file:
       - .env
 
-    ports:
-      - "8000:8000"
+    # `expose` (no `ports`) → el container NO bindea al host.
+    # Coolify (Traefik) enruta el dominio al puerto 8000 interno.
+    # Para development local, usá: docker compose run -p 8000:8000 hugo
+    # o agregá ports en un docker-compose.override.yml.
+    expose:
+      - "8000"
 
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://localhost:8000/health"]

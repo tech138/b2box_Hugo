@@ -1,0 +1,11 @@
+# Override solo para development local — agrega el bind al host 8000
+# Docker Compose lo carga automáticamente cuando hacés `docker compose up`
+# Coolify NO lo lee (usa solo docker-compose.yml).
+#
+# Si en local también te choca el 8000, cambialo a otro puerto:
+#   - "8001:8000"
+
+services:
+  hugo:
+    ports:
+      - "8000:8000"
