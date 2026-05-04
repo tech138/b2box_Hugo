@@ -408,8 +408,9 @@ async def list_audit_log(
     count_q = select(func.count(AuditLog.id))  # type: ignore[arg-type]
 
     if not include_dismissed:
-        base = base.where(AuditLog.dismissed == False)  # noqa: E712
-        count_q = count_q.where(AuditLog.dismissed == False)  # noqa: E712
+        # is_not(True) matchea False y NULL (filas previas a la migración)
+        base = base.where(AuditLog.dismissed.is_not(True))  # type: ignore[union-attr]
+        count_q = count_q.where(AuditLog.dismissed.is_not(True))  # type: ignore[union-attr]
     if section:
         base = _apply_section_filter(base, section)
         count_q = _apply_section_filter(count_q, section)
@@ -719,7 +720,7 @@ async def section_counts(
     for key, s in SECTIONS.items():
         stmt = (
             select(func.count(AuditLog.id))  # type: ignore[arg-type]
-            .where(AuditLog.dismissed == False)  # noqa: E712
+            .where(AuditLog.dismissed.is_not(True))  # type: ignore[union-attr]
         )
         stmt = _apply_section_filter(stmt, key)
         out[key] = {

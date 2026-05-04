@@ -35,8 +35,9 @@ engine = create_engine(_settings.database_url, **_engine_kwargs)
 def _add_missing_columns() -> None:
     """Para cada tabla del modelo, detecta columnas faltantes y las agrega.
 
-    Funciona tanto en SQLite como en Postgres. Para Postgres, usamos el
-    DDL compiler de SQLAlchemy para generar el tipo correcto por dialecto.
+    Funciona tanto en SQLite como en Postgres. Si el modelo declara un default
+    Python (ej. False, 0, ""), también seteamos ese valor en las filas existentes
+    para que no queden con NULL (que rompe los WHERE x = False posteriores).
     """
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
@@ -45,19 +46,26 @@ def _add_missing_columns() -> None:
     with engine.begin() as conn:
         for table_name, table in SQLModel.metadata.tables.items():
             if table_name not in existing_tables:
-                continue  # create_all la va a crear desde cero
+                continue
             existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
             for col in table.columns:
                 if col.name in existing_cols:
                     continue
-                # Usamos el compilador del dialecto para obtener el tipo correcto
                 col_type = col.type.compile(dialect=dialect)
-                # ALTER TABLE ADD COLUMN debe ser NULLable (sin NOT NULL) para
-                # tolerar filas existentes sin valor. Por eso asumimos nullable.
                 ddl = f'ALTER TABLE "{table_name}" ADD COLUMN "{col.name}" {col_type}'
                 log.warning("Migración: agregando columna %s.%s (%s)",
                             table_name, col.name, col_type)
                 conn.execute(text(ddl))
+                # Si la columna tiene default escalar, llenar filas existentes
+                default_val = getattr(col.default, "arg", None)
+                if default_val is not None and not callable(default_val):
+                    placeholder_val = default_val
+                    conn.execute(
+                        text(f'UPDATE "{table_name}" SET "{col.name}" = :v WHERE "{col.name}" IS NULL'),
+                        {"v": placeholder_val},
+                    )
+                    log.warning("Migración: backfill %s.%s = %r en filas existentes",
+                                table_name, col.name, placeholder_val)
 
 
 def init_db() -> None:
