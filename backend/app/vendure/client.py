@@ -44,6 +44,8 @@ class VendureProduct:
     image_urls: list[str]
     product_code: str | None  # b2boxProductCode (BX)
     featured_image_url: str | None  # primera imagen (preview/source)
+    first_variant_price_cents: int | None  # precio de la 1ra variante (centavos)
+    variant_count: int  # cuántas variantes tiene
 
 
 # ─── Cliente ───────────────────────────────────────────────────────
@@ -178,6 +180,10 @@ class VendureClient:
                   enabled
                   customFields {{ {self._source_field} b2boxProductCode }}
                   featuredAsset {{ source preview }}
+                  variantList(options: {{ take: 1 }}) {{
+                    items {{ priceWithTax }}
+                    totalItems
+                  }}
                 }}
                 totalItems
               }}
@@ -213,17 +219,23 @@ class VendureClient:
     # ── Escritura ──────────────────────────────────────────────
 
     async def disable_product(self, product_id: str) -> None:
+        await self._set_enabled(product_id, False)
+
+    async def enable_product(self, product_id: str) -> None:
+        await self._set_enabled(product_id, True)
+
+    async def _set_enabled(self, product_id: str, enabled: bool) -> None:
         mutation = gql(
             """
-            mutation DisableProduct($input: UpdateProductInput!) {
+            mutation SetEnabled($input: UpdateProductInput!) {
               updateProduct(input: $input) { id enabled }
             }
             """
         )
         await self._execute_with_retry(
             mutation,
-            {"input": {"id": product_id, "enabled": False}},
-            what=f"disable_product({product_id})",
+            {"input": {"id": product_id, "enabled": enabled}},
+            what=f"set_enabled({product_id}, {enabled})",
         )
 
     # ── Helpers ────────────────────────────────────────────────
@@ -274,6 +286,15 @@ class VendureClient:
         image_urls: list[str] = []
         if featured.get("source"):
             image_urls.append(featured["source"])
+        # Precio + cantidad de variantes (puede no venir en queries antiguas)
+        variant_list = raw.get("variantList") or {}
+        variant_items = variant_list.get("items") or []
+        first_price = None
+        if variant_items:
+            try:
+                first_price = int(variant_items[0].get("priceWithTax") or 0)
+            except (TypeError, ValueError):
+                first_price = None
         return VendureProduct(
             id=str(raw["id"]),
             name=raw.get("name", ""),
@@ -284,4 +305,6 @@ class VendureClient:
             image_urls=image_urls,
             product_code=custom.get("b2boxProductCode"),
             featured_image_url=featured_preview,
+            first_variant_price_cents=first_price,
+            variant_count=int(variant_list.get("totalItems") or len(variant_items)),
         )

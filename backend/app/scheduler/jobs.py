@@ -42,6 +42,7 @@ scheduler = AsyncIOScheduler()
 # Locks que evitan dos auditorías concurrentes del mismo tipo
 audit_prices_lock = asyncio.Lock()
 audit_dupes_lock = asyncio.Lock()
+audit_quality_lock = asyncio.Lock()
 
 # Cuántos productos consultar a OTAPI a la vez (1688 / RapidAPI tolera bien esto)
 PARALLEL_OTAPI = 10
@@ -111,28 +112,31 @@ async def audit_duplicates() -> None:
                     continue  # el otro producto será visto en su propia iteración
                 # Buscar el "kept" en la lista para denormalizar sus datos también
                 keep_prod = next((p for p in products if p.id == keep), None)
-                try:
-                    await client.disable_product(drop)
-                    session.add(AuditLog(
-                        action="duplicate_disabled",
-                        source="audit",
-                        product_id=drop,
-                        related_product_id=keep,
-                        confidence=verdict.confidence,
-                        detail=(
-                            f"Duplicado de {keep} por {','.join(verdict.matched_by)} "
-                            f"(score {verdict.confidence:.3f})"
-                        ),
-                        product_name=prod.name,
-                        product_code=prod.product_code,
-                        product_image_url=prod.featured_image_url,
-                        related_product_name=keep_prod.name if keep_prod else None,
-                        related_product_code=keep_prod.product_code if keep_prod else None,
-                    ))
-                    session.commit()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("No se pudo deshabilitar %s: %s", drop, exc)
-                    session.rollback()
+                # MODO SOLO-FLAGEAR: NO deshabilitamos en Vendure, solo logueamos.
+                # El usuario revisa la lista y decide manualmente cuáles deshabilitar.
+                # Guardamos los scores detallados para que pueda analizar por qué disparó.
+                session.add(AuditLog(
+                    action="duplicate_flagged",
+                    source="audit",
+                    product_id=drop,
+                    related_product_id=keep,
+                    confidence=verdict.confidence,
+                    detail=(
+                        f"Posible duplicado de #{keep} por {','.join(verdict.matched_by)} "
+                        f"(confianza {verdict.confidence:.0%}). Revisalo manualmente."
+                    ),
+                    after=json.dumps({
+                        "per_strategy_scores": verdict.per_strategy_scores,
+                        "matched_by": verdict.matched_by,
+                    }),
+                    product_name=prod.name,
+                    product_code=prod.product_code,
+                    product_image_url=prod.featured_image_url,
+                    product_source_url=prod.source_url,
+                    related_product_name=keep_prod.name if keep_prod else None,
+                    related_product_code=keep_prod.product_code if keep_prod else None,
+                ))
+                session.commit()
         log.info("audit_duplicates terminado")
 
 
@@ -269,7 +273,81 @@ async def audit_source_prices() -> None:
         )
 
 
-# ─── Job 3: digest diario ─────────────────────────────────────────
+# ─── Job 3: calidad del catálogo (precio 0, sin imagen, etc.) ─────
+
+
+def _detect_quality_issues(prod: VendureProduct) -> list[str]:
+    """Devuelve la lista de problemas detectados en un producto, o lista vacía."""
+    issues: list[str] = []
+    if not prod.featured_image_url:
+        issues.append("sin imagen")
+    if prod.first_variant_price_cents == 0:
+        issues.append("precio = 0")
+    if prod.first_variant_price_cents is None and prod.variant_count == 0:
+        issues.append("sin variantes")
+    if not prod.name or len(prod.name.strip()) < 3:
+        issues.append("nombre vacío o muy corto")
+    if not prod.source_url:
+        issues.append("sin link de proveedor")
+    return issues
+
+
+async def audit_catalog_quality() -> None:
+    if audit_quality_lock.locked():
+        log.warning("audit_catalog_quality ya está corriendo, ignoro")
+        return
+    async with audit_quality_lock:
+        log.info("Iniciando audit_catalog_quality")
+        client = VendureClient()
+        products = await _flatten_products(client)
+        log.info("Catálogo: %d productos a revisar", len(products))
+
+        flagged = 0
+        with Session(engine) as session:
+            for prod in products:
+                if not prod.enabled:
+                    continue
+                issues = _detect_quality_issues(prod)
+                if not issues:
+                    continue
+                price_str = (
+                    f"{prod.first_variant_price_cents/100:.2f}"
+                    if prod.first_variant_price_cents is not None
+                    else "—"
+                )
+                detail = (
+                    f"Producto con problemas: {', '.join(issues)}. "
+                    f"Precio actual: {price_str}, imágenes: "
+                    f"{'sí' if prod.featured_image_url else 'NO'}"
+                )
+                session.add(AuditLog(
+                    action="quality_issue_found",
+                    source="audit",
+                    product_id=prod.id,
+                    detail=detail[:500],
+                    product_name=prod.name,
+                    product_code=prod.product_code,
+                    product_image_url=prod.featured_image_url,
+                    product_source_url=prod.source_url,
+                ))
+                session.commit()
+                flagged += 1
+
+        if flagged:
+            await notify(
+                f"{flagged} productos con problemas de calidad",
+                f"Hugo revisó {len(products)} productos en Vendure y encontró {flagged} con problemas "
+                "(sin imagen, precio 0, sin link de proveedor, etc.). "
+                "Revisalos en el dashboard → tab 'Problemas de calidad'.",
+            )
+
+        log.info(
+            "audit_catalog_quality terminado: %d productos revisados, %d flagged",
+            len(products), flagged,
+        )
+
+
+# ─── Job 4: digest diario ─────────────────────────────────────────
 
 
 async def daily_digest() -> None:
@@ -304,6 +382,12 @@ def register_jobs() -> None:
         audit_source_prices,
         IntervalTrigger(hours=s.audit_interval_hours),
         id="audit_source_prices",
+        replace_existing=True, coalesce=True, max_instances=1,
+    )
+    scheduler.add_job(
+        audit_catalog_quality,
+        IntervalTrigger(hours=s.audit_interval_hours),
+        id="audit_catalog_quality",
         replace_existing=True, coalesce=True, max_instances=1,
     )
     scheduler.add_job(

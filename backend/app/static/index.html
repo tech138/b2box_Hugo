@@ -69,6 +69,10 @@
         class="w-full text-sm bg-rose-500 hover:bg-rose-600 text-white font-medium py-2 px-3 rounded-lg transition disabled:opacity-50">
         Buscar duplicados
       </button>
+      <button onclick="runAudit('quality', this)"
+        class="w-full text-sm bg-amber-500 hover:bg-amber-600 text-white font-medium py-2 px-3 rounded-lg transition disabled:opacity-50">
+        Revisar calidad
+      </button>
       <p id="action-feedback" class="hidden mt-2 p-2 rounded text-xs"></p>
     </div>
   </aside>
@@ -157,6 +161,7 @@ const SECTION_META = {
   price_changes: { icon: '💱', desc: 'Cambios de precio detectados en la fuente del proveedor (1688).' },
   sent_to_paco:  { icon: '🚀', desc: 'Productos que Hugo verificó como nuevos y reenvió a Paco para enriquecimiento.' },
   paco_errors:   { icon: '❗', desc: 'Productos nuevos que Hugo intentó mandar a Paco pero falló (timeouts, auth, etc.).' },
+  quality_issues:{ icon: '⚠️', desc: 'Productos del catálogo con problemas detectados: precio en 0, sin imagen, nombre vacío, etc. Revisá y eliminá manualmente.' },
   all:           { icon: '🗂️', desc: 'Todos los eventos de auditoría en orden cronológico.' },
   settings:      { icon: '⚙️', desc: 'Ajustes runtime de Hugo (umbrales, intervalos). Se aplican sin redeploy.' },
 };

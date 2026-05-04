@@ -80,6 +80,11 @@ _ACTION_LABELS: dict[str, dict[str, str]] = {
         "title": "Error",
         "tone": "danger",
     },
+    "quality_issue_found": {
+        "icon": "alert",
+        "title": "Producto con problemas (revisar/eliminar)",
+        "tone": "warning",
+    },
 }
 
 
@@ -153,6 +158,11 @@ SECTIONS: dict[str, dict[str, Any]] = {
         "label": "Errores con Paco",
         "source": None,
         "actions": ["paco_failed"],
+    },
+    "quality_issues": {
+        "label": "Problemas de calidad",
+        "source": None,
+        "actions": ["quality_issue_found"],
     },
     "all": {
         "label": "Todo",
@@ -308,36 +318,35 @@ async def audit_now(
 ) -> dict[str, str]:
     """Dispara una auditoría on-demand.
 
-    target: "all" (default) | "duplicates" | "prices"
-
-    Devuelve 409 si ya hay una auditoría del mismo tipo corriendo.
+    target: "all" (default) | "duplicates" | "prices" | "quality"
     """
     from app.scheduler.jobs import (
+        audit_catalog_quality,
         audit_dupes_lock,
         audit_duplicates,
         audit_prices_lock,
+        audit_quality_lock,
         audit_source_prices,
     )
     import asyncio
 
     wants_prices = target in ("prices", "all")
     wants_dupes = target in ("duplicates", "all")
+    wants_quality = target in ("quality", "all")
 
     if wants_prices and audit_prices_lock.locked():
-        raise HTTPException(
-            status_code=409,
-            detail="Ya hay una auditoría de precios en curso. Esperá a que termine.",
-        )
+        raise HTTPException(409, "Ya hay una auditoría de precios en curso.")
     if wants_dupes and audit_dupes_lock.locked():
-        raise HTTPException(
-            status_code=409,
-            detail="Ya hay una auditoría de duplicados en curso. Esperá a que termine.",
-        )
+        raise HTTPException(409, "Ya hay una auditoría de duplicados en curso.")
+    if wants_quality and audit_quality_lock.locked():
+        raise HTTPException(409, "Ya hay una auditoría de calidad en curso.")
 
     if wants_dupes:
         asyncio.create_task(audit_duplicates())
     if wants_prices:
         asyncio.create_task(audit_source_prices())
+    if wants_quality:
+        asyncio.create_task(audit_catalog_quality())
     return {"status": "scheduled", "target": target}
 
 
@@ -445,6 +454,125 @@ async def reset_setting(key: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"key": key, "value": new_value, "ok": True, "reset": True}
+
+
+@router.get("/api/duplicates-stats")
+async def duplicates_stats(
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Resumen agregado de los duplicados detectados:
+    - cuántos hay
+    - cuántos disparó cada estrategia (url / image / text)
+    - score promedio por estrategia
+    - distribución del score (>=0.99, 0.95-0.99, 0.90-0.95, <0.90)
+    """
+    rows = list(session.exec(
+        select(AuditLog).where(
+            AuditLog.action.in_(["duplicate_flagged", "duplicate_disabled"])  # type: ignore[attr-defined]
+        )
+    ))
+
+    total = len(rows)
+    by_strategy = {"url": 0, "image": 0, "text": 0}
+    score_buckets = {"99-100": 0, "95-99": 0, "90-95": 0, "<90": 0}
+    score_sums = {"url": 0.0, "image": 0.0, "text": 0.0}
+    score_counts = {"url": 0, "image": 0, "text": 0}
+
+    for r in rows:
+        # Bucket por confidence
+        c = r.confidence or 0.0
+        if c >= 0.99:
+            score_buckets["99-100"] += 1
+        elif c >= 0.95:
+            score_buckets["95-99"] += 1
+        elif c >= 0.90:
+            score_buckets["90-95"] += 1
+        else:
+            score_buckets["<90"] += 1
+
+        # Si tiene `after` con scores detallados, los usamos
+        if r.after:
+            try:
+                data = json.loads(r.after)
+                for s in (data.get("matched_by") or []):
+                    if s in by_strategy:
+                        by_strategy[s] += 1
+                for k, v in (data.get("per_strategy_scores") or {}).items():
+                    if k in score_sums and v is not None:
+                        score_sums[k] += float(v)
+                        score_counts[k] += 1
+                continue
+            except (ValueError, TypeError):
+                pass
+        # Fallback: parsear el detail (eventos viejos)
+        detail = (r.detail or "").lower()
+        for s in by_strategy:
+            if s in detail:
+                by_strategy[s] += 1
+
+    avg_score = {
+        k: (score_sums[k] / score_counts[k]) if score_counts[k] else None
+        for k in score_sums
+    }
+
+    return {
+        "total_flagged": total,
+        "by_strategy": by_strategy,
+        "score_buckets": score_buckets,
+        "average_score_per_strategy": avg_score,
+        "hint": (
+            "Si la mayoría tiene score 0.90-0.95, podés subir el threshold a 0.97 "
+            "para reducir falsos positivos. Andá a Configuración."
+        ),
+    }
+
+
+@router.post("/api/restore-duplicates")
+async def restore_duplicates(
+    confirm: bool = False,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Re-habilita en Vendure todos los productos que Hugo deshabilitó (action='duplicate_disabled').
+
+    Pasale ?confirm=true para ejecutar de verdad. Sin confirm, solo te dice cuántos restauraría.
+    """
+    stmt = select(AuditLog).where(AuditLog.action == "duplicate_disabled")
+    rows = list(session.exec(stmt))
+    total = len(rows)
+    unique_ids = sorted({r.product_id for r in rows if r.product_id and r.product_id != "(nuevo)"})
+
+    if not confirm:
+        return {
+            "would_restore": len(unique_ids),
+            "total_disable_events": total,
+            "preview_ids": unique_ids[:20],
+            "hint": "Llamá de nuevo con ?confirm=true para ejecutar",
+        }
+
+    client = VendureClient()
+    restored: list[str] = []
+    failed: list[dict[str, str]] = []
+    for pid in unique_ids:
+        try:
+            await client.enable_product(pid)
+            restored.append(pid)
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"product_id": pid, "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    # Loguear que se hizo restauración masiva
+    session.add(AuditLog(
+        action="duplicates_restored_bulk",
+        source="manual",
+        product_id="(bulk)",
+        detail=f"Restauración masiva: {len(restored)} productos re-habilitados, {len(failed)} fallaron.",
+    ))
+    session.commit()
+
+    return {
+        "restored": len(restored),
+        "failed": len(failed),
+        "failed_details": failed[:10],
+    }
 
 
 @router.get("/api/debug-config")
