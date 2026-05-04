@@ -75,3 +75,6 @@ class AuditLog(SQLModel, table=True):
     product_source_url: str | None = Field(default=None)  # link al proveedor
     related_product_name: str | None = Field(default=None)
     related_product_code: str | None = Field(default=None)
+    # Acciones manuales del usuario sobre el evento
+    dismissed: bool = Field(default=False, index=True, description="Descartado por el usuario")
+    dismissed_at: datetime | None = Field(default=None)

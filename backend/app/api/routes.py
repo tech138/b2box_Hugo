@@ -99,6 +99,7 @@ def _humanize(entry: AuditLog) -> dict[str, Any]:
         "title": meta["title"],
         "icon": meta["icon"],
         "tone": meta["tone"],
+        "dismissed": entry.dismissed,
         "product": {
             "id": entry.product_id,
             "name": entry.product_name,
@@ -390,20 +391,25 @@ async def list_audit_log(
     limit: int = 25,
     section: str | None = None,
     action: str | None = None,
+    include_dismissed: bool = False,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """Devuelve eventos paginados.
 
     Params:
-      skip    — offset para paginación
-      limit   — page size (max 100)
-      section — filtra por tab (inbox_luis, duplicates, price_changes, sent_to_paco, all)
-      action  — filtra por action puntual (compatibilidad)
+      skip               — offset para paginación
+      limit              — page size (max 100)
+      section            — filtra por tab
+      action             — filtra por action puntual
+      include_dismissed  — por defecto False, ocultar eventos descartados
     """
     limit = max(1, min(100, limit))
     base = select(AuditLog)
     count_q = select(func.count(AuditLog.id))  # type: ignore[arg-type]
 
+    if not include_dismissed:
+        base = base.where(AuditLog.dismissed == False)  # noqa: E712
+        count_q = count_q.where(AuditLog.dismissed == False)  # noqa: E712
     if section:
         base = _apply_section_filter(base, section)
         count_q = _apply_section_filter(count_q, section)
@@ -454,6 +460,78 @@ async def reset_setting(key: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"key": key, "value": new_value, "ok": True, "reset": True}
+
+
+@router.post("/api/audit-log/{event_id}/dismiss")
+async def dismiss_event(
+    event_id: int,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Marca un evento como descartado. No vuelve a aparecer en el listado por defecto."""
+    entry = session.get(AuditLog, event_id)
+    if not entry:
+        raise HTTPException(404, "Evento no encontrado")
+    entry.dismissed = True
+    entry.dismissed_at = datetime.utcnow()
+    session.add(entry)
+    session.commit()
+    return {"ok": True, "id": event_id}
+
+
+@router.post("/api/audit-log/{event_id}/retry-paco")
+async def retry_paco(
+    event_id: int,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Reintenta enviar un evento a Paco (solo si tiene image_url guardada).
+
+    Crea un nuevo AuditLog con el resultado y descarta el original.
+    """
+    entry = session.get(AuditLog, event_id)
+    if not entry:
+        raise HTTPException(404, "Evento no encontrado")
+    if not entry.product_image_url:
+        raise HTTPException(400, "Este evento no tiene image_url para reintentar")
+
+    # Llamar a Paco
+    try:
+        result = await paco_integration.submit(entry.product_image_url)
+        new_action = "verify_passed_to_paco"
+        new_detail = (
+            f"Reintento manual exitoso. '{(entry.product_name or '?')[:60]}' "
+            f"enviado a Paco (search_id={result.search_id})"
+        )
+        new_after = json.dumps({"paco_search_id": result.search_id, "retry_of": event_id})
+        session.add(AuditLog(
+            action=new_action,
+            source="manual",
+            product_id=entry.product_id,
+            detail=new_detail,
+            after=new_after,
+            product_name=entry.product_name,
+            product_code=entry.product_code,
+            product_image_url=entry.product_image_url,
+            product_source_url=entry.product_source_url,
+        ))
+        # Marcar el evento original como dismissed (ya se resolvió)
+        entry.dismissed = True
+        entry.dismissed_at = datetime.utcnow()
+        session.add(entry)
+        session.commit()
+        return {"ok": True, "paco_search_id": result.search_id, "paco_status": result.status}
+    except paco_integration.PacoError as exc:
+        session.add(AuditLog(
+            action="paco_failed",
+            source="manual",
+            product_id=entry.product_id,
+            detail=f"Reintento manual falló: {str(exc)[:200]}",
+            product_name=entry.product_name,
+            product_code=entry.product_code,
+            product_image_url=entry.product_image_url,
+            product_source_url=entry.product_source_url,
+        ))
+        session.commit()
+        raise HTTPException(502, f"Paco rechazó el reintento: {exc}")
 
 
 @router.get("/api/duplicates-stats")
@@ -636,10 +714,13 @@ async def debug_config() -> dict[str, Any]:
 async def section_counts(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """Devuelve los conteos de cada sección/tab del dashboard."""
+    """Devuelve los conteos de cada sección/tab del dashboard. Excluye eventos descartados."""
     out: dict[str, Any] = {}
     for key, s in SECTIONS.items():
-        stmt = select(func.count(AuditLog.id))  # type: ignore[arg-type]
+        stmt = (
+            select(func.count(AuditLog.id))  # type: ignore[arg-type]
+            .where(AuditLog.dismissed == False)  # noqa: E712
+        )
         stmt = _apply_section_filter(stmt, key)
         out[key] = {
             "label": s["label"],
